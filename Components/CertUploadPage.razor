@@ -1,0 +1,178 @@
+@* CertUploadPage.razor
+   Upload entry point: user picks a PDF, it gets sent to the extraction
+   service, and on success we hand the result + a URL to the saved PDF
+   off to CertReviewPage for verification.
+*@
+@using SteelCertExtraction.Domain.Models
+@using SteelCertExtraction.Persistence
+@using SteelCertExtraction.Services
+@inject ICertExtractionService ExtractionService
+@inject ICertificateStore CertificateStore
+@inject ILogger<CertUploadPage> Logger
+
+<MudContainer MaxWidth="MaxWidth.False" Class="pa-4">
+
+    @if (_result is null)
+    {
+        <MudPaper Class="pa-6" Outlined="true">
+            <MudText Typo="Typo.h6" Class="mb-4">Upload Steel Certificate</MudText>
+
+            <MudFileUpload T="IBrowserFile" Accept=".pdf" FilesChanged="OnFileSelected" Disabled="_isProcessing">
+                <ActivatorContent>
+                    <MudButton Variant="Variant.Filled"
+                               Color="Color.Primary"
+                               StartIcon="@Icons.Material.Filled.UploadFile"
+                               Disabled="_isProcessing">
+                        Choose PDF
+                    </MudButton>
+                </ActivatorContent>
+            </MudFileUpload>
+
+            @if (_selectedFileName is not null)
+            {
+                <MudText Typo="Typo.body2" Class="mt-2">Selected: @_selectedFileName</MudText>
+            }
+
+            @if (_isProcessing)
+            {
+                <MudProgressLinear Indeterminate="true" Class="mt-4" />
+                <MudText Typo="Typo.caption" Class="mt-1">Extracting data — this can take 10-30s per page...</MudText>
+            }
+
+            @if (_errorMessage is not null)
+            {
+                <MudAlert Severity="Severity.Error" Class="mt-4">@_errorMessage</MudAlert>
+            }
+        </MudPaper>
+    }
+    else
+    {
+        <CertReviewPage Certificates="_result.Certificates"
+                         PageCount="_result.PageCount"
+                         PdfUrl="@_savedPdfUrl"
+                         SaveResults="_saveResults"
+                         OnConfirm="HandleConfirm" />
+    }
+
+</MudContainer>
+
+@code {
+    private const long MaxFileSizeBytes = 25 * 1024 * 1024; // 25 MB — generous for a multi-page cert PDF
+
+    private bool _isProcessing;
+    private string? _errorMessage;
+    private string? _selectedFileName;
+    private ExtractionResult? _result;
+    private string? _savedPdfUrl;
+
+    /// <summary>
+    /// Stable on-disk/blob location for the uploaded PDF. The extraction
+    /// pipeline only needs a Stream, but the review UI's PDF.js viewer
+    /// needs a URL it can fetch independently — so the file gets persisted
+    /// here, separate from the extraction call itself.
+    /// </summary>
+    private async Task OnFileSelected(IBrowserFile? file)
+    {
+        if (file is null) return;
+
+        _errorMessage = null;
+        _selectedFileName = file.Name;
+
+        if (file.Size > MaxFileSizeBytes)
+        {
+            _errorMessage = $"File is too large ({file.Size / 1024 / 1024} MB). Maximum is 25 MB.";
+            return;
+        }
+
+        if (!file.Name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            _errorMessage = "Only PDF files are supported.";
+            return;
+        }
+
+        _isProcessing = true;
+        StateHasChanged();
+
+        try
+        {
+            // 1. Persist the upload so the PDF.js viewer has a stable URL to
+            // load independently of this request's lifetime. Swap this for
+            // whatever storage you're already using (local disk under
+            // wwwroot, Azure Blob, S3, etc.) — shown here as local disk
+            // since that's the simplest drop-in for a low-volume internal tool.
+            var savedPath = await SaveUploadedPdfAsync(file);
+            _savedPdfUrl = $"/uploaded-certs/{Path.GetFileName(savedPath)}";
+
+            // 2. Run extraction against a fresh stream of the same file.
+            // Vendor key would normally come from a dropdown/lookup tied to
+            // the PO or vendor record this cert is associated with — hardcoded
+            // here as a placeholder since that mapping lives in your domain.
+            await using var stream = File.OpenRead(savedPath);
+            _result = await ExtractionService.ExtractAsync(
+                stream,
+                sourceFileName: file.Name,
+                vendorKey: null); // TODO: resolve from PO/vendor context
+        }
+        catch (CertExtractionParseException ex)
+        {
+            Logger.LogError(ex, "Model response failed to parse for {FileName}. Raw: {Raw}",
+                file.Name, ex.RawResponse);
+            _errorMessage = "The model's response couldn't be parsed. Try re-uploading, " +
+                             "or check logs if this keeps happening.";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Extraction failed for {FileName}", file.Name);
+            _errorMessage = $"Extraction failed: {ex.Message}";
+        }
+        finally
+        {
+            _isProcessing = false;
+            StateHasChanged();
+        }
+    }
+
+    private static async Task<string> SaveUploadedPdfAsync(IBrowserFile file)
+    {
+        var uploadsDir = Path.Combine("wwwroot", "uploaded-certs");
+        Directory.CreateDirectory(uploadsDir);
+
+        // Prefix with a GUID to avoid collisions between vendors uploading
+        // files with identical names (e.g. every vendor's cert is "cert.pdf").
+        var safeFileName = $"{Guid.NewGuid():N}_{file.Name}";
+        var savedPath = Path.Combine(uploadsDir, safeFileName);
+
+        await using var destStream = File.Create(savedPath);
+        await using var sourceStream = file.OpenReadStream(maxAllowedSize: MaxFileSizeBytes);
+        await sourceStream.CopyToAsync(destStream);
+
+        return savedPath;
+    }
+
+    // Outcome of the last save attempt per certificate; shown on each review card.
+    private readonly Dictionary<SteelCertificate, SaveCertificateResult> _saveResults = new();
+
+    private async Task HandleConfirm(SteelCertificate cert)
+    {
+        if (_result is null || _savedPdfUrl is null) return;
+
+        try
+        {
+            var outcome = await CertificateStore.SaveConfirmedAsync(cert, _result, _savedPdfUrl);
+            _saveResults[cert] = outcome;
+            Logger.LogInformation("Save of heat number {HeatNumber}: {Outcome}",
+                cert.HeatNumber?.Value, outcome.GetType().Name);
+        }
+        catch (Exception ex)
+        {
+            // Unexpected failure (database down, etc.): log details, show a
+            // generic message — the review UI renders this as an error list.
+            Logger.LogError(ex, "Saving certificate with heat number {HeatNumber} failed",
+                cert.HeatNumber?.Value);
+            _saveResults[cert] = new SaveCertificateResult.Invalid(new[]
+            {
+                "Could not save: the database returned an error or is unavailable. Details were logged.",
+            });
+        }
+    }
+}

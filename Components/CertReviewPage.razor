@@ -1,0 +1,725 @@
+@* CertReviewPage.razor
+   Side-by-side cert verification: PDF.js viewer (left) + extracted fields (right).
+   Clicking/hovering a field highlights its source region on the PDF page.
+   Any field can be corrected, added or cleared inline; an edit un-ticks the
+   confirm box (it must be confirmed again) and is marked "edited", with the
+   model's original value kept so it can be reverted and audited.
+*@
+@using Microsoft.AspNetCore.Components.Web
+@using SteelCertExtraction.Domain.Models
+@using SteelCertExtraction.Persistence
+@using SteelCertExtraction.Services
+@inject IJSRuntime JS
+
+<div class="cert-review-layout">
+
+    <div class="pdf-pane">
+        <div class="pdf-toolbar">
+            <MudIconButton Icon="@Icons.Material.Filled.ChevronLeft"
+                           OnClick="@(() => GoToPage(_currentPage - 1))"
+                           Disabled="@(_currentPage <= 1)" />
+            <span class="pdf-page-indicator">Page @_currentPage of @PageCount</span>
+            <MudIconButton Icon="@Icons.Material.Filled.ChevronRight"
+                           OnClick="@(() => GoToPage(_currentPage + 1))"
+                           Disabled="@(_currentPage >= PageCount)" />
+        </div>
+
+        <div class="pdf-canvas-wrapper" id="pdf-canvas-wrapper-@ContainerId">
+            <canvas id="pdf-canvas-@ContainerId"></canvas>
+            <div id="pdf-highlight-@ContainerId" class="pdf-highlight" style="display:none;"></div>
+        </div>
+    </div>
+
+    <div class="fields-pane">
+        @foreach (var cert in Certificates)
+        {
+            <MudCard Class="cert-card" Outlined="true">
+                <MudCardHeader>
+                    <CardHeaderContent>
+                        <MudText Typo="Typo.subtitle1">
+                            Heat @(cert.HeatNumber?.Value ?? "(not found)")
+                        </MudText>
+                        @if (MissingRequired(cert).Any())
+                        {
+                            <MudAlert Severity="Severity.Warning" Dense="true" Class="mt-1">
+                                Missing: @string.Join(", ", MissingRequired(cert))
+                            </MudAlert>
+                        }
+                    </CardHeaderContent>
+                </MudCardHeader>
+                <MudCardContent>
+                    @RenderSection(cert, SectionCertificate)
+
+                    <MudDivider Class="my-3" />
+                    <MudText Typo="Typo.caption" Class="section-label">Chemistry (%)</MudText>
+                    @RenderSection(cert, SectionChemistry)
+
+                    <MudDivider Class="my-3" />
+                    <MudText Typo="Typo.caption" Class="section-label">Mechanical</MudText>
+                    @RenderSection(cert, SectionMechanical)
+
+                    <MudDivider Class="my-3" />
+                    <MudText Typo="Typo.caption" Class="section-label">Other measurements</MudText>
+                    @RenderMeasurements(cert)
+                </MudCardContent>
+                <MudCardActions Style="flex-direction:column; align-items:stretch;">
+                    @if (SaveResults.TryGetValue(cert, out var outcome))
+                    {
+                        if (outcome is SaveCertificateResult.Saved)
+                        {
+                            <MudAlert Severity="Severity.Success" Dense="true" Class="mb-2">
+                                Saved.
+                            </MudAlert>
+                        }
+                        else if (outcome is SaveCertificateResult.Duplicate dup)
+                        {
+                            <MudAlert Severity="Severity.Warning" Dense="true" Class="mb-2">
+                                Not saved — heat number <b>@dup.Existing.HeatNumber</b> already exists
+                                (grade @dup.Existing.Grade, from <i>@dup.Existing.SourceFileName</i>,
+                                confirmed @dup.Existing.ConfirmedAtUtc.ToString("yyyy-MM-dd HH:mm") UTC).
+                            </MudAlert>
+                        }
+                        else if (outcome is SaveCertificateResult.Invalid invalid)
+                        {
+                            <MudAlert Severity="Severity.Error" Dense="true" Class="mb-2">
+                                Not saved:
+                                <ul style="margin:0; padding-left:1.25rem;">
+                                    @foreach (var reason in invalid.Reasons)
+                                    {
+                                        <li>@reason</li>
+                                    }
+                                </ul>
+                            </MudAlert>
+                        }
+                    }
+                    @if (HasOpenEditor(cert))
+                    {
+                        <MudText Typo="Typo.caption" Class="mb-1">Apply or cancel the open edit before saving.</MudText>
+                    }
+                    <MudButton Color="Color.Primary" Variant="Variant.Filled"
+                               Disabled="@(ReadOnly(cert) || HasOpenEditor(cert))"
+                               OnClick="@(() => ConfirmAndSave(cert))">
+                        @(IsSaved(cert) ? "Saved" : _busy.Contains(cert) ? "Saving…" : "Confirm & Save")
+                    </MudButton>
+                </MudCardActions>
+            </MudCard>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public List<SteelCertificate> Certificates { get; set; } = new();
+    [Parameter] public int PageCount { get; set; }
+    [Parameter] public string PdfUrl { get; set; } = string.Empty;
+    [Parameter] public EventCallback<SteelCertificate> OnConfirm { get; set; }
+
+    /// <summary>Outcome of the last save attempt per certificate, owned by the parent.</summary>
+    [Parameter] public IReadOnlyDictionary<SteelCertificate, SaveCertificateResult> SaveResults { get; set; }
+        = new Dictionary<SteelCertificate, SaveCertificateResult>();
+
+    // Certificates with a save in flight — stops a double-click saving twice.
+    private readonly HashSet<SteelCertificate> _busy = new();
+
+    // Inline editors currently open, keyed by (certificate, field name).
+    private sealed class EditState
+    {
+        public string Text { get; set; } = string.Empty;
+        public string? Error { get; set; }
+    }
+    private readonly Dictionary<(SteelCertificate Cert, string Key), EditState> _editing = new();
+
+    private bool IsSaved(SteelCertificate cert) =>
+        SaveResults.TryGetValue(cert, out var outcome) && outcome is SaveCertificateResult.Saved;
+
+    // Rows are read-only while a save is in flight and after a successful save.
+    private bool ReadOnly(SteelCertificate cert) => _busy.Contains(cert) || IsSaved(cert);
+
+    private bool HasOpenEditor(SteelCertificate cert) =>
+        _editing.Keys.Any(k => ReferenceEquals(k.Cert, cert))
+        || cert.Measurements.Any(m => _measurementEditing.ContainsKey(m))
+        || _adding.ContainsKey(cert);
+
+    // Live, from the CURRENT values — adding a heat number clears the warning.
+    private static IEnumerable<string> MissingRequired(SteelCertificate cert)
+    {
+        if (string.IsNullOrWhiteSpace(cert.HeatNumber?.Value)) yield return nameof(SteelCertificate.HeatNumber);
+        if (string.IsNullOrWhiteSpace(cert.Grade?.Value)) yield return nameof(SteelCertificate.Grade);
+    }
+
+    // Unique per-instance ID so multiple review panels can exist on one page
+    // without colliding JS interop element IDs.
+    private readonly string ContainerId = Guid.NewGuid().ToString("N")[..8];
+    private int _currentPage = 1;
+    private IJSObjectReference? _pdfViewerModule;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && !string.IsNullOrEmpty(PdfUrl))
+        {
+            _pdfViewerModule = await JS.InvokeAsync<IJSObjectReference>(
+                "import", "./js/pdf-cert-viewer.js");
+            await _pdfViewerModule.InvokeVoidAsync(
+                "initViewer", ContainerId, PdfUrl);
+        }
+    }
+
+    private async Task GoToPage(int page)
+    {
+        if (page < 1 || page > PageCount) return;
+        _currentPage = page;
+        if (_pdfViewerModule is not null)
+        {
+            await _pdfViewerModule.InvokeVoidAsync("renderPage", ContainerId, page);
+        }
+    }
+
+    /// <summary>
+    /// Core interaction: hovering a field jumps the PDF view to that field's
+    /// page (if not already there) and draws the highlight at its bbox.
+    /// </summary>
+    private async Task HighlightField(int page, BoundingBox? bbox)
+    {
+        if (bbox is null || _pdfViewerModule is null) return;
+
+        if (_currentPage != page)
+        {
+            await GoToPage(page);
+        }
+
+        await _pdfViewerModule.InvokeVoidAsync(
+            "highlightRegion", ContainerId, bbox.X, bbox.Y, bbox.W, bbox.H);
+    }
+
+    private async Task ClearHighlight()
+    {
+        if (_pdfViewerModule is not null)
+        {
+            await _pdfViewerModule.InvokeVoidAsync("clearHighlight", ContainerId);
+        }
+    }
+
+    private async Task ConfirmAndSave(SteelCertificate cert)
+    {
+        if (!_busy.Add(cert)) return;
+        try
+        {
+            await OnConfirm.InvokeAsync(cert);
+        }
+        finally
+        {
+            _busy.Remove(cert);
+        }
+    }
+
+    // --- Editing ------------------------------------------------------
+
+    private void StartEdit<T>(SteelCertificate cert, string key, ExtractedField<T>? field, Func<T, string?> format)
+    {
+        var text = field is null || field.Value is null ? string.Empty : format(field.Value!) ?? string.Empty;
+        _editing[(cert, key)] = new EditState { Text = text };
+    }
+
+    private void CancelEdit(SteelCertificate cert, string key) => _editing.Remove((cert, key));
+
+    private void ApplyEdit<T>(
+        SteelCertificate cert, string key, ExtractedField<T>? field,
+        Action<ExtractedField<T>> assign, Func<ValidationOutcome, T> toValue)
+    {
+        if (!_editing.TryGetValue((cert, key), out var edit)) return;
+
+        var outcome = ExtractedValueValidator.Validate(key, edit.Text);
+        if (!outcome.IsValid)
+        {
+            edit.Error = outcome.Error;   // stay open, show the problem inline
+            return;
+        }
+
+        var newValue = toValue(outcome);
+        var target = field;
+        if (target is null)
+        {
+            // The model produced nothing for this field: create it. An added value
+            // has no original, page 0 and no highlight box.
+            target = new ExtractedField<T>();
+            assign(target);
+        }
+
+        if (!EqualityComparer<T>.Default.Equals(target.Value, newValue))
+        {
+            target.Value = newValue;
+            target.Confirmed = false;     // never auto-confirm: the corrected value must be ticked again
+        }
+
+        _editing.Remove((cert, key));
+    }
+
+    private void OnEditKeyDown<T>(
+        KeyboardEventArgs e, SteelCertificate cert, string key, ExtractedField<T>? field,
+        Action<ExtractedField<T>> assign, Func<ValidationOutcome, T> toValue)
+    {
+        if (e.Key == "Enter") ApplyEdit(cert, key, field, assign, toValue);
+        else if (e.Key == "Escape") CancelEdit(cert, key);
+    }
+
+    private static void Revert<T>(ExtractedField<T> field)
+    {
+        field.Value = field.OriginalValue;
+        field.Confirmed = false;
+    }
+
+    private static string OriginalText<T>(ExtractedField<T> field, Func<T, string?> format)
+    {
+        var text = field.OriginalValue is null ? null : format(field.OriginalValue);
+        return string.IsNullOrWhiteSpace(text) ? "Model extracted: nothing" : $"Model extracted: {text}";
+    }
+
+    private static string Label(string key) => ExtractedValueValidator.RuleFor(key).Label;
+
+    private static string Placeholder(string key) => ExtractedValueValidator.RuleFor(key).Kind switch
+    {
+        FieldKind.Date => "YYYY-MM-DD",
+        FieldKind.Decimal => "number",
+        _ => string.Empty,
+    };
+
+    // --- Rows: one descriptor per field, grouped into sections ---------
+
+    private const string SectionCertificate = "Certificate";
+    private const string SectionChemistry = "Chemistry";
+    private const string SectionMechanical = "Mechanical";
+
+    /// <summary>
+    /// How to find, test and draw one field. Listing every field once here (instead of one
+    /// hand-written line per field in the markup) keeps the screen manageable as fields are added.
+    /// </summary>
+    private sealed record RowDescriptor(
+        string Section,
+        string Key,
+        bool AlwaysVisible,
+        Func<SteelCertificate, bool> HasValue,
+        Func<SteelCertificate, bool> IsEdited,
+        Func<SteelCertificate, RenderFragment> Render);
+
+    private List<RowDescriptor>? _rowsCache;
+    private List<RowDescriptor> Rows => _rowsCache ??= BuildRows();
+
+    // Sections the reviewer has expanded to show their empty rows, per certificate.
+    private readonly HashSet<(SteelCertificate Cert, string Section)> _expanded = new();
+
+    private RowDescriptor TextRow(
+        string section, string key, bool alwaysVisible,
+        Func<SteelCertificate, ExtractedField<string>?> get, Action<SteelCertificate, ExtractedField<string>> set) =>
+        new(section, key, alwaysVisible,
+            c => !string.IsNullOrWhiteSpace(get(c)?.Value),
+            c => get(c)?.IsEdited ?? false,
+            c => RenderText(c, key, get(c), f => set(c, f)));
+
+    private RowDescriptor NumberRow(
+        string section, string key,
+        Func<SteelCertificate, ExtractedField<decimal?>?> get, Action<SteelCertificate, ExtractedField<decimal?>> set) =>
+        new(section, key, false,
+            c => get(c)?.Value is not null,
+            c => get(c)?.IsEdited ?? false,
+            c => RenderNumber(c, key, get(c), f => set(c, f)));
+
+    private RowDescriptor DateRow(
+        string section, string key,
+        Func<SteelCertificate, ExtractedField<DateOnly?>?> get, Action<SteelCertificate, ExtractedField<DateOnly?>> set) =>
+        new(section, key, false,
+            c => get(c)?.Value is not null,
+            c => get(c)?.IsEdited ?? false,
+            c => RenderDate(c, key, get(c), f => set(c, f)));
+
+    // Display order. Heat Number and Grade are required, so they are always shown.
+    private List<RowDescriptor> BuildRows() => new()
+    {
+        TextRow(SectionCertificate, nameof(SteelCertificate.HeatNumber), true, c => c.HeatNumber, (c, f) => c.HeatNumber = f),
+        TextRow(SectionCertificate, nameof(SteelCertificate.Grade), true, c => c.Grade, (c, f) => c.Grade = f),
+        TextRow(SectionCertificate, nameof(SteelCertificate.Specification), false, c => c.Specification, (c, f) => c.Specification = f),
+        TextRow(SectionCertificate, nameof(SteelCertificate.CertifyingLab), false, c => c.CertifyingLab, (c, f) => c.CertifyingLab = f),
+        DateRow(SectionCertificate, nameof(SteelCertificate.CertDate), c => c.CertDate, (c, f) => c.CertDate = f),
+        TextRow(SectionCertificate, nameof(SteelCertificate.PurchaseOrderNumber), false, c => c.PurchaseOrderNumber, (c, f) => c.PurchaseOrderNumber = f),
+
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.CarbonPct), c => c.Chemistry.CarbonPct, (c, f) => c.Chemistry.CarbonPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.ManganesePct), c => c.Chemistry.ManganesePct, (c, f) => c.Chemistry.ManganesePct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.PhosphorusPct), c => c.Chemistry.PhosphorusPct, (c, f) => c.Chemistry.PhosphorusPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.SulfurPct), c => c.Chemistry.SulfurPct, (c, f) => c.Chemistry.SulfurPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.SiliconPct), c => c.Chemistry.SiliconPct, (c, f) => c.Chemistry.SiliconPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.ChromiumPct), c => c.Chemistry.ChromiumPct, (c, f) => c.Chemistry.ChromiumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.NickelPct), c => c.Chemistry.NickelPct, (c, f) => c.Chemistry.NickelPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.MolybdenumPct), c => c.Chemistry.MolybdenumPct, (c, f) => c.Chemistry.MolybdenumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.CopperPct), c => c.Chemistry.CopperPct, (c, f) => c.Chemistry.CopperPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.VanadiumPct), c => c.Chemistry.VanadiumPct, (c, f) => c.Chemistry.VanadiumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.NitrogenPct), c => c.Chemistry.NitrogenPct, (c, f) => c.Chemistry.NitrogenPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.CobaltPct), c => c.Chemistry.CobaltPct, (c, f) => c.Chemistry.CobaltPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.BoronPct), c => c.Chemistry.BoronPct, (c, f) => c.Chemistry.BoronPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.AluminumPct), c => c.Chemistry.AluminumPct, (c, f) => c.Chemistry.AluminumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.TitaniumPct), c => c.Chemistry.TitaniumPct, (c, f) => c.Chemistry.TitaniumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.NiobiumPct), c => c.Chemistry.NiobiumPct, (c, f) => c.Chemistry.NiobiumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.TungstenPct), c => c.Chemistry.TungstenPct, (c, f) => c.Chemistry.TungstenPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.TinPct), c => c.Chemistry.TinPct, (c, f) => c.Chemistry.TinPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.LeadPct), c => c.Chemistry.LeadPct, (c, f) => c.Chemistry.LeadPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.ArsenicPct), c => c.Chemistry.ArsenicPct, (c, f) => c.Chemistry.ArsenicPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.AntimonyPct), c => c.Chemistry.AntimonyPct, (c, f) => c.Chemistry.AntimonyPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.CalciumPct), c => c.Chemistry.CalciumPct, (c, f) => c.Chemistry.CalciumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.OxygenPct), c => c.Chemistry.OxygenPct, (c, f) => c.Chemistry.OxygenPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.HydrogenPct), c => c.Chemistry.HydrogenPct, (c, f) => c.Chemistry.HydrogenPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.TantalumPct), c => c.Chemistry.TantalumPct, (c, f) => c.Chemistry.TantalumPct = f),
+        NumberRow(SectionChemistry, nameof(ChemistryComposition.CarbonEquivalent), c => c.Chemistry.CarbonEquivalent, (c, f) => c.Chemistry.CarbonEquivalent = f),
+
+        NumberRow(SectionMechanical, nameof(MechanicalProperties.YieldStrengthPsi), c => c.Mechanical.YieldStrengthPsi, (c, f) => c.Mechanical.YieldStrengthPsi = f),
+        NumberRow(SectionMechanical, nameof(MechanicalProperties.TensileStrengthPsi), c => c.Mechanical.TensileStrengthPsi, (c, f) => c.Mechanical.TensileStrengthPsi = f),
+        NumberRow(SectionMechanical, nameof(MechanicalProperties.ElongationPct), c => c.Mechanical.ElongationPct, (c, f) => c.Mechanical.ElongationPct = f),
+        TextRow(SectionMechanical, nameof(MechanicalProperties.ReductionOfAreaPct), false, c => c.Mechanical.ReductionOfAreaPct, (c, f) => c.Mechanical.ReductionOfAreaPct = f),
+        NumberRow(SectionMechanical, nameof(MechanicalProperties.HardnessValue), c => c.Mechanical.HardnessValue, (c, f) => c.Mechanical.HardnessValue = f),
+        TextRow(SectionMechanical, nameof(MechanicalProperties.HardnessScale), false, c => c.Mechanical.HardnessScale, (c, f) => c.Mechanical.HardnessScale = f),
+    };
+
+    // A row is shown when it is required, has a value, was edited (even if cleared, so the
+    // reviewer can see and revert it), is being edited, or its section is expanded.
+    private bool IsRowVisible(SteelCertificate cert, RowDescriptor row) =>
+        row.AlwaysVisible
+        || row.HasValue(cert)
+        || row.IsEdited(cert)
+        || _expanded.Contains((cert, row.Section))
+        || _editing.ContainsKey((cert, row.Key));
+
+    // How many optional rows in a section are currently empty (what the toggle line hides/reveals).
+    private int EmptyCount(SteelCertificate cert, string section) =>
+        Rows.Count(r => r.Section == section && !r.AlwaysVisible && !r.HasValue(cert) && !r.IsEdited(cert));
+
+    private void ToggleExpanded(SteelCertificate cert, string section)
+    {
+        if (!_expanded.Remove((cert, section))) _expanded.Add((cert, section));
+    }
+
+    /// <summary>The visible rows of one section, then one line to show/hide the empty optional ones.</summary>
+    private RenderFragment RenderSection(SteelCertificate cert, string section) => @<text>
+        @foreach (var row in Rows.Where(r => r.Section == section && IsRowVisible(cert, r)))
+        {
+            <div @key="(cert, row.Key)">
+                @row.Render(cert)
+            </div>
+        }
+        @if (EmptyCount(cert, section) > 0)
+        {
+            <div class="collapse-toggle-row">
+                <MudButton Variant="Variant.Text" Size="Size.Small" Class="collapse-toggle"
+                           OnClick="@(() => ToggleExpanded(cert, section))">
+                    @(_expanded.Contains((cert, section))
+                        ? $"Hide {EmptyCount(cert, section)} empty"
+                        : $"{EmptyCount(cert, section)} not found on this certificate — show")
+                </MudButton>
+            </div>
+        }
+    </text>;
+
+    // --- Row rendering ------------------------------------------------
+
+    private RenderFragment RenderText(SteelCertificate cert, string key, ExtractedField<string>? field, Action<ExtractedField<string>> assign) =>
+        RenderRow(cert, key, field, assign, FormatText, ToText);
+
+    private RenderFragment RenderNumber(SteelCertificate cert, string key, ExtractedField<decimal?>? field, Action<ExtractedField<decimal?>> assign) =>
+        RenderRow(cert, key, field, assign, FormatNumber, ToNumber);
+
+    private RenderFragment RenderDate(SteelCertificate cert, string key, ExtractedField<DateOnly?>? field, Action<ExtractedField<DateOnly?>> assign) =>
+        RenderRow(cert, key, field, assign, FormatDate, ToDate);
+
+    /// <summary>
+    /// One row for any field type. View mode: label, formatted value ("—" when
+    /// missing), hover highlight at the field's bbox, "edited" marker + revert,
+    /// edit/add control, and a confirm checkbox when there is a value.
+    /// Edit mode: an inline input with Apply/Cancel (Enter / Esc) and an inline error.
+    /// </summary>
+    private RenderFragment RenderRow<T>(
+        SteelCertificate cert, string key, ExtractedField<T>? field,
+        Action<ExtractedField<T>> assign, Func<T, string?> format, Func<ValidationOutcome, T> toValue) => @<text>
+        @if (_editing.TryGetValue((cert, key), out var edit))
+        {
+            <div class="field-row field-editing"
+                 @onmouseenter="@(() => HighlightField(field?.PageNumber ?? 0, field?.BoundingBox))"
+                 @onmouseleave="ClearHighlight">
+                <span class="field-label">@Label(key)</span>
+                <MudTextField T="string" @bind-Value="edit.Text" Immediate="true" AutoFocus="true"
+                              Variant="Variant.Outlined" Margin="Margin.Dense"
+                              Placeholder="@Placeholder(key)"
+                              Error="@(edit.Error is not null)" ErrorText="@edit.Error"
+                              OnKeyDown="@((KeyboardEventArgs e) => OnEditKeyDown(e, cert, key, field, assign, toValue))" />
+                <MudIconButton Icon="@Icons.Material.Filled.Check" Size="Size.Small" Color="Color.Success"
+                               aria-label="Apply edit"
+                               OnClick="@(() => ApplyEdit(cert, key, field, assign, toValue))" />
+                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                               aria-label="Cancel edit"
+                               OnClick="@(() => CancelEdit(cert, key))" />
+            </div>
+        }
+        else
+        {
+            <div class="field-row @(field is null || field.Value is null ? "field-missing" : "")"
+                 @onmouseenter="@(() => HighlightField(field?.PageNumber ?? 0, field?.BoundingBox))"
+                 @onmouseleave="ClearHighlight">
+                <span class="field-label">@Label(key)</span>
+                <span class="field-value">@(field is null || field.Value is null ? "—" : format(field.Value!))</span>
+                <span class="field-actions">
+                    @* Plain `title` tooltips on purpose: MudTooltip needs MudBlazor's popover provider,
+                       which is not visible inside this interactive-server island (it crashed the render). *@
+                    @if (field is not null && field.IsEdited)
+                    {
+                        <span class="edited-badge" title="@OriginalText(field, format)">edited</span>
+                        @if (!ReadOnly(cert))
+                        {
+                            <MudIconButton Icon="@Icons.Material.Filled.Undo" Size="Size.Small"
+                                           title="Revert to the extracted value"
+                                           aria-label="Revert to the extracted value"
+                                           OnClick="@(() => Revert(field))" />
+                        }
+                    }
+                    @if (!ReadOnly(cert))
+                    {
+                        <MudIconButton Icon="@(field is null || field.Value is null ? Icons.Material.Filled.Add : Icons.Material.Filled.Edit)"
+                                       Size="Size.Small"
+                                       title="@(field is null || field.Value is null ? "Add a value" : "Edit")"
+                                       aria-label="@(field is null || field.Value is null ? "Add a value" : "Edit")"
+                                       OnClick="@(() => StartEdit(cert, key, field, format))" />
+                    }
+                </span>
+                @if (field is not null && field.Value is not null)
+                {
+                    <MudCheckBox T="bool" @bind-Value="field.Confirmed" Dense="true" Disabled="@ReadOnly(cert)" />
+                }
+            </div>
+        }
+    </text>;
+
+    // --- Other measurements -------------------------------------------
+    // The rules (what can be added, how edit / remove / revert change state) live in
+    // MeasurementEditor and are unit-tested; this is only the screen. The type picker is a
+    // plain <select>: MudSelect needs the popover provider that crashes inside this page.
+
+    private sealed class MeasurementEditState
+    {
+        public string Value { get; set; } = string.Empty;
+        public string Unit { get; set; } = string.Empty;
+        public string Condition { get; set; } = string.Empty;
+        public string? ValueError { get; set; }
+        public string? UnitError { get; set; }
+        public string? ConditionError { get; set; }
+    }
+
+    private sealed class AddMeasurementState
+    {
+        public string SelectedKey { get; set; } = string.Empty;
+        public string CustomLabel { get; set; } = string.Empty;
+        public string? Error { get; set; }
+    }
+
+    private readonly Dictionary<ExtractedMeasurement, MeasurementEditState> _measurementEditing = new();
+    private readonly Dictionary<SteelCertificate, AddMeasurementState> _adding = new();
+
+    private void OpenAdd(SteelCertificate cert) => _adding[cert] = new AddMeasurementState();
+
+    private void CancelAdd(SteelCertificate cert) => _adding.Remove(cert);
+
+    private void ConfirmAdd(SteelCertificate cert)
+    {
+        if (!_adding.TryGetValue(cert, out var add)) return;
+
+        var (measurement, error) = MeasurementEditor.Add(cert, add.SelectedKey, add.CustomLabel);
+        if (measurement is null)
+        {
+            add.Error = error;      // stay open and say why
+            return;
+        }
+
+        _adding.Remove(cert);
+        StartMeasurementEdit(measurement);   // go straight to typing its value
+    }
+
+    private void StartMeasurementEdit(ExtractedMeasurement measurement)
+    {
+        var current = measurement.Field.Value;
+        _measurementEditing[measurement] = new MeasurementEditState
+        {
+            Value = current?.Value ?? string.Empty,
+            Unit = current?.Unit ?? string.Empty,
+            Condition = current?.Condition ?? string.Empty,
+        };
+    }
+
+    private void CancelMeasurementEdit(SteelCertificate cert, ExtractedMeasurement measurement)
+    {
+        _measurementEditing.Remove(measurement);
+        MeasurementEditor.DiscardIfEmpty(cert, measurement);   // a cancelled add leaves nothing behind
+    }
+
+    private void ApplyMeasurementEdit(ExtractedMeasurement measurement)
+    {
+        if (!_measurementEditing.TryGetValue(measurement, out var edit)) return;
+
+        var outcome = MeasurementEditor.Apply(measurement, edit.Value, edit.Unit, edit.Condition);
+        if (!outcome.IsValid)
+        {
+            edit.ValueError = outcome.ValueError;
+            edit.UnitError = outcome.UnitError;
+            edit.ConditionError = outcome.ConditionError;
+            return;
+        }
+
+        _measurementEditing.Remove(measurement);
+    }
+
+    private void RemoveMeasurement(SteelCertificate cert, ExtractedMeasurement measurement)
+    {
+        _measurementEditing.Remove(measurement);
+        MeasurementEditor.Remove(cert, measurement);
+    }
+
+    private void OnMeasurementKeyDown(KeyboardEventArgs e, SteelCertificate cert, ExtractedMeasurement measurement)
+    {
+        if (e.Key == "Enter") ApplyMeasurementEdit(measurement);
+        else if (e.Key == "Escape") CancelMeasurementEdit(cert, measurement);
+    }
+
+    private static string MeasurementOriginalText(ExtractedMeasurement measurement) =>
+        measurement.Field.OriginalValue?.Value is null
+            ? "Model extracted: nothing"
+            : $"Model extracted: {measurement.Field.OriginalValue.Display}";
+
+    private RenderFragment RenderMeasurements(SteelCertificate cert) => @<text>
+        @if (!MeasurementEditor.Ordered(cert, _measurementEditing.Keys).Any())
+        {
+            <div class="field-row">
+                <span class="field-label">None found on this certificate.</span>
+            </div>
+        }
+        @foreach (var measurement in MeasurementEditor.Ordered(cert, _measurementEditing.Keys).ToList())
+        {
+            <div @key="measurement">
+                @RenderMeasurementRow(cert, measurement)
+            </div>
+        }
+        @RenderAddMeasurement(cert)
+    </text>;
+
+    private RenderFragment RenderMeasurementRow(SteelCertificate cert, ExtractedMeasurement measurement) => @<text>
+        @if (_measurementEditing.TryGetValue(measurement, out var edit))
+        {
+            <div class="field-row field-editing measurement-editing"
+                 @onmouseenter="@(() => HighlightField(measurement.Field.PageNumber, measurement.Field.BoundingBox))"
+                 @onmouseleave="ClearHighlight">
+                <span class="field-label">@measurement.Label</span>
+                <div class="measurement-inputs">
+                    <MudTextField T="string" @bind-Value="edit.Value" Immediate="true" AutoFocus="true"
+                                  Label="Value" Variant="Variant.Outlined" Margin="Margin.Dense"
+                                  Error="@(edit.ValueError is not null)" ErrorText="@edit.ValueError"
+                                  OnKeyDown="@((KeyboardEventArgs e) => OnMeasurementKeyDown(e, cert, measurement))" />
+                    <MudTextField T="string" @bind-Value="edit.Unit" Immediate="true"
+                                  Label="Unit" Variant="Variant.Outlined" Margin="Margin.Dense"
+                                  Error="@(edit.UnitError is not null)" ErrorText="@edit.UnitError"
+                                  OnKeyDown="@((KeyboardEventArgs e) => OnMeasurementKeyDown(e, cert, measurement))" />
+                    <MudTextField T="string" @bind-Value="edit.Condition" Immediate="true"
+                                  Label="Condition" Variant="Variant.Outlined" Margin="Margin.Dense"
+                                  Error="@(edit.ConditionError is not null)" ErrorText="@edit.ConditionError"
+                                  OnKeyDown="@((KeyboardEventArgs e) => OnMeasurementKeyDown(e, cert, measurement))" />
+                </div>
+                <MudIconButton Icon="@Icons.Material.Filled.Check" Size="Size.Small" Color="Color.Success"
+                               aria-label="Apply edit"
+                               OnClick="@(() => ApplyMeasurementEdit(measurement))" />
+                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                               aria-label="Cancel edit"
+                               OnClick="@(() => CancelMeasurementEdit(cert, measurement))" />
+            </div>
+        }
+        else
+        {
+            var hasValue = MeasurementEditor.HasValue(measurement);
+            <div class="field-row @(hasValue ? "" : "field-missing")"
+                 @onmouseenter="@(() => HighlightField(measurement.Field.PageNumber, measurement.Field.BoundingBox))"
+                 @onmouseleave="ClearHighlight">
+                <span class="field-label">@measurement.Label</span>
+                <span class="field-value">@(hasValue ? measurement.Field.Value!.Display : "removed")</span>
+                <span class="field-actions">
+                    @if (measurement.Field.IsEdited)
+                    {
+                        <span class="edited-badge" title="@MeasurementOriginalText(measurement)">edited</span>
+                    }
+                    @if (!ReadOnly(cert))
+                    {
+                        @if (measurement.Field.IsEdited && measurement.Field.OriginalValue is not null)
+                        {
+                            <MudIconButton Icon="@Icons.Material.Filled.Undo" Size="Size.Small"
+                                           title="Revert to the extracted value"
+                                           aria-label="Revert to the extracted value"
+                                           OnClick="@(() => MeasurementEditor.Revert(measurement))" />
+                        }
+                        @if (hasValue)
+                        {
+                            <MudIconButton Icon="@Icons.Material.Filled.Edit" Size="Size.Small"
+                                           title="Edit" aria-label="Edit"
+                                           OnClick="@(() => StartMeasurementEdit(measurement))" />
+                            <MudIconButton Icon="@Icons.Material.Filled.DeleteOutline" Size="Size.Small"
+                                           title="Remove this measurement" aria-label="Remove this measurement"
+                                           OnClick="@(() => RemoveMeasurement(cert, measurement))" />
+                        }
+                    }
+                </span>
+                @if (hasValue)
+                {
+                    <MudCheckBox T="bool" @bind-Value="measurement.Field.Confirmed" Dense="true" Disabled="@ReadOnly(cert)" />
+                }
+            </div>
+        }
+    </text>;
+
+    private RenderFragment RenderAddMeasurement(SteelCertificate cert) => @<text>
+        @if (!ReadOnly(cert))
+        {
+            @if (_adding.TryGetValue(cert, out var add))
+            {
+                <div class="measurement-add">
+                    <select class="measurement-select" aria-label="Measurement type" @bind="add.SelectedKey">
+                        <option value="">Choose a measurement…</option>
+                        @foreach (var kind in MeasurementEditor.AvailableKinds(cert))
+                        {
+                            <option value="@kind.Key">@kind.Label (@MeasurementCatalog.CategoryLabel(kind.Category))</option>
+                        }
+                        @if (MeasurementEditor.CanAddOther(cert))
+                        {
+                            <option value="@MeasurementCatalog.OtherKey">Other — type a label…</option>
+                        }
+                    </select>
+                    @if (add.SelectedKey == MeasurementCatalog.OtherKey)
+                    {
+                        <MudTextField T="string" @bind-Value="add.CustomLabel" Immediate="true"
+                                      Label="Label as printed" Variant="Variant.Outlined" Margin="Margin.Dense" />
+                    }
+                    <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary"
+                               OnClick="@(() => ConfirmAdd(cert))">Add</MudButton>
+                    <MudButton Size="Size.Small" OnClick="@(() => CancelAdd(cert))">Cancel</MudButton>
+                    @if (add.Error is not null)
+                    {
+                        <MudText Typo="Typo.caption" Color="Color.Error" Class="measurement-add-error">@add.Error</MudText>
+                    }
+                </div>
+            }
+            else
+            {
+                <div class="collapse-toggle-row">
+                    <MudButton Variant="Variant.Text" Size="Size.Small" Class="collapse-toggle"
+                               StartIcon="@Icons.Material.Filled.Add"
+                               OnClick="@(() => OpenAdd(cert))">Add measurement</MudButton>
+                </div>
+            }
+        }
+    </text>;
+
+    private static string? FormatText(string value) => value;
+    private static string? FormatNumber(decimal? value) => value?.ToString("0.####");
+    private static string? FormatDate(DateOnly? value) => value?.ToString("yyyy-MM-dd");
+
+    // Convert validated input back to the field's value type. A cleared (blank) optional
+    // field yields null — the model's Value properties are nullable.
+    private static string ToText(ValidationOutcome outcome) => outcome.Text!;
+    private static decimal? ToNumber(ValidationOutcome outcome) => outcome.Number;
+    private static DateOnly? ToDate(ValidationOutcome outcome) => outcome.Date;
+}

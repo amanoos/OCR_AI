@@ -1,0 +1,8 @@
+bin/
+obj/
+*.user
+
+# Uploaded vendor certs are runtime data, not source — and are compliance-
+# sensitive. Keep the directory but ignore its contents.
+wwwroot/uploaded-certs/*
+!wwwroot/uploaded-certs/.gitkeep

@@ -1,0 +1,10 @@
+@page "/"
+@rendermode InteractiveServer
+
+<PageTitle>Cert Extraction</PageTitle>
+
+@* Routable host for the cert upload + review workflow. The upload and review
+   components are non-routable building blocks; this page is the entry point.
+   Interactivity comes from the global Interactive Server render mode set in
+   Program.cs / App.razor. *@
+<CertUploadPage />

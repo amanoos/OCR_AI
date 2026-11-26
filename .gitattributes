@@ -1,0 +1,4 @@
+* text=auto
+# Vendored libraries: keep bytes exactly as downloaded
+wwwroot/lib/** -text
+*.pdf binary

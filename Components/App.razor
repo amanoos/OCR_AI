@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    @* No web-font link on purpose: the app must make no requests to external hosts
+       (corporate networks block CDNs). MudBlazor falls back to the system sans-serif. *@
+    <link rel="stylesheet" href="_content/MudBlazor/MudBlazor.min.css" />
+    <link rel="stylesheet" href="@Assets["css/cert-review.css"]" />
+    <link rel="stylesheet" href="@Assets["app.css"]" />
+    <ImportMap />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <HeadOutlet />
+</head>
+
+<body>
+    <Routes />
+
+    @* PDF.js (v3 UMD build) exposes the global `pdfjsLib` that
+       pdf-cert-viewer.js depends on. A plain (non-module) script sets the
+       global synchronously, avoiding ESM load-order races against the
+       viewer module. The worker source must match this exact version or page
+       rendering silently no-ops. Both files are vendored (3.11.174) under
+       wwwroot/lib/pdfjs — see NOTICE.txt there; always upgrade them together. *@
+    <script src="lib/pdfjs/pdf.min.js"></script>
+    <script>
+        if (window.pdfjsLib) {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = "lib/pdfjs/pdf.worker.min.js";
+        }
+    </script>
+
+    <script src="_framework/blazor.web.js"></script>
+    <script src="_content/MudBlazor/MudBlazor.min.js"></script>
+</body>
+
+</html>
