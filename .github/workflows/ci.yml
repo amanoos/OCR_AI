@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch/PR; a newer push cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore tests/SteelCertExtraction.Tests
+
+      - name: Build (Release)
+        run: dotnet build tests/SteelCertExtraction.Tests --configuration Release --no-restore
+
+      # Tests use fake HTTP handlers and in-memory SQLite: no API keys, SQL Server or network needed.
+      - name: Test
+        run: dotnet test tests/SteelCertExtraction.Tests --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: tests/SteelCertExtraction.Tests/TestResults/*.trx
+          if-no-files-found: ignore
