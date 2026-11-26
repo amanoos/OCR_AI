@@ -1,5 +1,7 @@
 # Steel Vendor Cert Extraction — Project Handoff
 
+> Resuming on another machine (e.g. the office)? Start with [HANDOFF.md](HANDOFF.md): current state, what to do first, what is unverified, next work.
+
 ## What this is
 
 A feature for extracting structured data (heat number, grade, chemistry,
