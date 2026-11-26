@@ -140,6 +140,16 @@ Beyond the original 20 fields the extraction now captures **16 more chemistry el
 - **NOT verified (needs more PDFs):** impact/Charpy extraction (only manual add was tested), ppm→% conversion, carbon-steel certs, other vendors' layouts, LiteLLM/Bedrock. Optional measurements vary run to run (melt practice, reduction ratio, mill name, gauge length, test direction). Highlights on inline running text (e.g. grain size) are looser than table-cell boxes.
 - **Not built:** per-vendor catalogs, units conversion beyond ppm→%, multiple values per property (e.g. several Charpy specimens, several hardness readings), editing saved certs.
 
+## Repository, CI and branch rules
+
+- **Repo:** https://github.com/amanoos/OCR_AI (public), default branch `main`. The git root is this folder (`cert-extraction/`); the parent folder `e:\Workspace\OCR_AI` is not part of the repo.
+- **Never commit:** API keys, the connection string, uploaded vendor PDFs (`wwwroot/uploaded-certs/*` is ignored; only `.gitkeep` is tracked), `bin/`, `obj/`. Secrets live in user-secrets. `.gitattributes` keeps `wwwroot/lib/**` (vendored PDF.js) byte-for-byte unchanged — don't let line-ending conversion touch those files.
+- **CI:** `.github/workflows/ci.yml`, one job named **`build-and-test`** (Ubuntu, .NET 10): restore → Release build → `dotnet test tests/SteelCertExtraction.Tests`. Runs on every push to `main` and every pull request; a newer push cancels the older run; test results are uploaded as an artifact. Needs no secrets: tests use fake HTTP handlers and in-memory SQLite, so CI never calls an LLM or SQL Server. It does NOT cover the Razor UI or real SQL Server migrations. Keep the Release build at 0 warnings.
+- **Branch protection on `main`:** the `build-and-test` check is **required**, the branch must be up to date before merging (`strict`), force-pushes and deletion are blocked, and **administrators are enforced too** (no bypass). Pull requests and reviews are not required (solo project).
+  - **Consequence: you cannot push directly to `main`.** Work on a branch: `git switch -c <name>` → commit → `git push -u origin <name>` → `gh pr create` → wait for `build-and-test` to pass → `gh pr merge --squash --delete-branch`. If the branch is behind `main`, update it first (`git merge origin/main` or the PR's "Update branch").
+  - If CI itself is broken and blocks its own fix, an admin can temporarily turn off "Do not allow bypassing the above settings" under Settings → Branches (or `gh api -X DELETE repos/amanoos/OCR_AI/branches/main/protection/enforce_admins`), then turn it back on (`-X POST` on the same path).
+  - If the job is ever renamed, update the required check name in the branch protection rule, or merges will wait forever for a check that no longer exists.
+
 ## Known gaps / explicit TODOs
 
 1. **Persistence: done and verified** (2026-11-26) — see "Persistence". Remaining persistence work is only the deferred list (saved-cert list page, editing a saved certificate, who confirmed, etc.). The `CertDb` table currently holds one test row (heat P02V, from `Sample-MTR-304L-Stainless-Steel.pdf`); delete it if you want a clean database.
